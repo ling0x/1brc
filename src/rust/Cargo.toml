@@ -7,6 +7,10 @@ edition = "2021"
 name = "calculate_average"
 path = "src/main.rs"
 
+[[bin]]
+name = "create_measurements"
+path = "src/create_measurements.rs"
+
 [dependencies]
 rayon      = "1"
 rustc-hash = "2"
