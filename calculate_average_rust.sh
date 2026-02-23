@@ -1,19 +1,19 @@
 #!/bin/bash
 #
 # Runs the Rust 1BRC implementation.
-# Build first with:  cd src/rust && cargo build --release
+# Always rebuilds (cargo is fast when nothing changed).
 #
 set -e
 
 INPUT="${1:-measurements.txt}"
 
-BIN="./src/rust/target/release/calculate_average"
-
-if [ ! -f "$BIN" ]; then
-  echo "Binary not found. Building…"
-  pushd src/rust > /dev/null
-  cargo build --release
-  popd > /dev/null
+if [ ! -f "$INPUT" ]; then
+  echo "ERROR: input file not found: $INPUT" >&2
+  exit 1
 fi
 
-exec "$BIN" "$INPUT"
+pushd src/rust > /dev/null
+cargo build --release --quiet
+popd > /dev/null
+
+exec ./src/rust/target/release/calculate_average "$INPUT"
