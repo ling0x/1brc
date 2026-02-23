@@ -5,8 +5,6 @@
 //!
 //! Writes <count> lines of "StationName;XX.X" to the output file
 //! (default: measurements.txt in the current working directory).
-//!
-//! Uses multiple threads + buffered I/O for fast generation.
 
 use std::{
     env,
@@ -410,14 +408,15 @@ const STATIONS: &[(&str, f32, f32)] = &[
     ("Zürich",                   -10.0, 30.0),
 ];
 
-/// Very fast LCG pseudo-random number generator (no deps needed).
+/// Fast LCG pseudo-random number generator.
 struct Lcg(u64);
 impl Lcg {
     fn new(seed: u64) -> Self { Lcg(seed ^ 0xdeadbeef_cafebabe) }
     #[inline]
     fn next_f32(&mut self) -> f32 {
-        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-        // Upper 24 bits -> [0, 1)
+        self.0 = self.0
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         ((self.0 >> 40) as f32) / (1u32 << 24) as f32
     }
 }
@@ -436,14 +435,13 @@ fn main() -> io::Result<()> {
     let mut out = BufWriter::with_capacity(1 << 20, file);
 
     let n = STATIONS.len();
-    let mut rng = Lcg::new(count ^ 0x1brc);
+    // Fixed: 0x1b4c is a valid hex literal (was 0x1brc which is not)
+    let mut rng = Lcg::new(count ^ 0x1b4c_u64);
 
     for i in 0..count {
         let idx = (i as usize) % n;
         let (name, lo, hi) = STATIONS[idx];
-        // Generate a temperature uniformly in [lo, hi] with one decimal place
         let t = lo + rng.next_f32() * (hi - lo);
-        // Round to 1 dp
         let tenths = (t * 10.0).round() as i32;
         let sign   = if tenths < 0 { "-" } else { "" };
         let abs    = tenths.unsigned_abs();
