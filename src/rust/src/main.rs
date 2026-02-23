@@ -1,14 +1,13 @@
-//! One-Billion-Row Challenge – Rust implementation
+//! One-Billion-Row Challenge — Rust implementation
 //!
-//! Strategy:
-//!   • Memory-map the input file (zero-copy reads).
-//!   • Split the mapped slice into N chunks (one per Rayon thread),
-//!     each aligned to a newline boundary.
-//!   • Each thread accumulates stats in a thread-local FxHashMap.
-//!   • Merge all per-thread maps, then sort and print.
+//! Approach:
+//!   1. Memory-map the input file.
+//!   2. Split into N byte-aligned chunks (one per CPU thread).
+//!   3. Each Rayon thread builds an owned HashMap<String, Stats>.
+//!   4. Merge partial maps, sort by name, print.
 //!
-//! Temperatures are stored as i32 tenths-of-a-degree (e.g. 12.3 → 123)
-//! to avoid any floating-point parsing overhead.
+//! Temperatures are kept as i32 tenths-of-a-degree throughout to
+//! avoid floating-point parsing.  E.g. "-12.3" → -123.
 
 use memmap2::Mmap;
 use rayon::prelude::*;
@@ -16,12 +15,10 @@ use rustc_hash::FxHashMap;
 use std::{
     env, fs,
     io::{self, Write},
-    os::unix::io::FromRawFd,
 };
 
-// -----------------------------------------------------------------
-// Per-station accumulator (integer tenths of a degree)
-// -----------------------------------------------------------------
+// ── Stats ────────────────────────────────────────────────────────
+
 #[derive(Clone)]
 struct Stats {
     min:   i32,
@@ -53,141 +50,164 @@ impl Stats {
     }
 }
 
-// -----------------------------------------------------------------
-// Fast integer parser for signed values like "-12.3" or "4.5"
-// Returns tenths-of-a-degree as i32.
-// Input slice ends just before '\n' (or end-of-chunk).
-// -----------------------------------------------------------------
+// ── Temperature parser ───────────────────────────────────────────
+//
+// Handles: "-99.9" "-9.9" "9.9" "99.9"
+// Input slice must contain exactly the characters between ';' and '\n'.
+
 #[inline]
-fn parse_temp(bytes: &[u8]) -> i32 {
-    let (neg, rest) = if bytes[0] == b'-' {
-        (true, &bytes[1..])
-    } else {
-        (false, bytes)
-    };
+fn parse_temp(b: &[u8]) -> i32 {
+    let mut i = 0usize;
+    let neg = if b[i] == b'-' { i += 1; true } else { false };
 
-    // rest is one of:  "X.X"  "XX.X"
-    let val = match rest {
-        [a, b'.', c] => {
-            ((*a - b'0') as i32) * 10 + ((*c - b'0') as i32)
-        }
-        [a, b, b'.', c] => {
-            ((*a - b'0') as i32) * 100
-                + ((*b - b'0') as i32) * 10
-                + ((*c - b'0') as i32)
-        }
-        _ => panic!("unexpected temp format: {:?}", std::str::from_utf8(rest)),
-    };
+    // Read up to two digits before the decimal point
+    let mut v = (b[i] - b'0') as i32;
+    i += 1;
+    if b[i] != b'.' {
+        v = v * 10 + (b[i] - b'0') as i32;
+        i += 1;
+    }
+    // skip '.'
+    i += 1;
+    // one fractional digit
+    v = v * 10 + (b[i] - b'0') as i32;
 
-    if neg { -val } else { val }
+    if neg { -v } else { v }
 }
 
-// -----------------------------------------------------------------
-// Process one chunk (a slice of bytes that starts and ends on line
-// boundaries).  Returns a local FxHashMap<&[u8], Stats>.
-// We use raw byte slices as keys to avoid allocation; the backing
-// memory is the mmap which lives for the whole program.
-// -----------------------------------------------------------------
-fn process_chunk(chunk: &[u8]) -> FxHashMap<&[u8], Stats> {
-    let mut map: FxHashMap<&[u8], Stats> =
-        FxHashMap::with_capacity_and_hasher(1 << 10, Default::default());
+// ── Chunk splitter ───────────────────────────────────────────────
+//
+// Divides `data` into `n` roughly equal slices, each ending on a
+// newline boundary so no line is split across two chunks.
+
+fn split_at_newlines(data: &[u8], n: usize) -> Vec<(usize, usize)> {
+    if data.is_empty() { return vec![]; }
+    let chunk_size = (data.len() / n).max(1);
+    let mut ranges = Vec::with_capacity(n + 1);
+    let mut start = 0usize;
+
+    for _ in 0..n {
+        if start >= data.len() { break; }
+        let mut end = (start + chunk_size).min(data.len() - 1);
+        // Advance to the byte just after the next '\n'
+        while end < data.len() - 1 && data[end] != b'\n' {
+            end += 1;
+        }
+        end += 1; // move past the '\n'
+        ranges.push((start, end));
+        start = end;
+    }
+    // Tail that didn't fit in an exact chunk
+    if start < data.len() {
+        ranges.push((start, data.len()));
+    }
+    ranges
+}
+
+// ── Per-chunk processing ─────────────────────────────────────────
+
+fn process_chunk(chunk: &[u8]) -> FxHashMap<String, Stats> {
+    let mut map: FxHashMap<String, Stats> =
+        FxHashMap::with_capacity_and_hasher(1 << 11, Default::default());
 
     let mut pos = 0usize;
     let len = chunk.len();
 
     while pos < len {
-        // Find ';'
-        let semi = memchr(b';', &chunk[pos..]).unwrap_or(len - pos) + pos;
-        let name = &chunk[pos..semi];
+        // ── find ';' ──
+        let mut semi = pos;
+        while semi < len && chunk[semi] != b';' {
+            semi += 1;
+        }
+        if semi >= len { break; } // malformed / trailing newline
 
-        // Find '\n'
-        let nl_offset = semi + 1;
-        let nl = memchr(b'\n', &chunk[nl_offset..]).unwrap_or(len - nl_offset)
-            + nl_offset;
-        let temp_bytes = &chunk[nl_offset..nl];
+        // ── find end of line ──
+        let temp_start = semi + 1;
+        let mut eol = temp_start;
+        while eol < len && chunk[eol] != b'\n' {
+            eol += 1;
+        }
+
+        // Trim possible '\r' (CRLF files)
+        let temp_end = if eol > temp_start && chunk[eol - 1] == b'\r' {
+            eol - 1
+        } else {
+            eol
+        };
+
+        let name_bytes = &chunk[pos..semi];
+        let temp_bytes = &chunk[temp_start..temp_end];
+
+        if temp_bytes.is_empty() {
+            pos = eol + 1;
+            continue;
+        }
 
         let val = parse_temp(temp_bytes);
 
-        map.entry(name)
-            .and_modify(|s| s.update(val))
-            .or_insert_with(|| Stats::new(val));
+        // Use raw_entry to avoid double-hashing on the hot path
+        match map.get_mut(std::str::from_utf8(name_bytes).unwrap_or("")) {
+            Some(s) => s.update(val),
+            None => {
+                let name = String::from_utf8_lossy(name_bytes).into_owned();
+                map.insert(name, Stats::new(val));
+            }
+        }
 
-        pos = nl + 1;
+        pos = eol + 1;
     }
 
     map
 }
 
-// -----------------------------------------------------------------
-// Tiny memchr helper (avoids pulling in the memchr crate)
-// -----------------------------------------------------------------
-#[inline]
-fn memchr(needle: u8, haystack: &[u8]) -> Option<usize> {
-    haystack.iter().position(|&b| b == needle)
-}
+// ── Output helper ────────────────────────────────────────────────
 
-// -----------------------------------------------------------------
-// Split mmap into ~equal chunks aligned to newline boundaries
-// -----------------------------------------------------------------
-fn split_chunks(data: &[u8], n: usize) -> Vec<&[u8]> {
-    if data.is_empty() { return vec![]; }
-    let chunk_size = data.len().saturating_div(n).max(1);
-    let mut chunks = Vec::with_capacity(n);
-    let mut start = 0usize;
-
-    for _ in 0..n {
-        if start >= data.len() { break; }
-        let mut end = (start + chunk_size).min(data.len());
-        // Advance to the next newline boundary
-        while end < data.len() && data[end] != b'\n' {
-            end += 1;
-        }
-        if end < data.len() { end += 1; } // include the '\n'
-        chunks.push(&data[start..end]);
-        start = end;
-    }
-    // Any leftover bytes (last chunk)
-    if start < data.len() {
-        chunks.push(&data[start..]);
-    }
-    chunks
-}
-
-// -----------------------------------------------------------------
-// Formatting helper: convert tenths-of-degree to "XX.X"
-// -----------------------------------------------------------------
 #[inline]
 fn fmt_temp(tenths: i32) -> String {
     let sign = if tenths < 0 { "-" } else { "" };
-    let abs = tenths.unsigned_abs();
+    let abs  = tenths.unsigned_abs();
     format!("{}{}.{}", sign, abs / 10, abs % 10)
 }
 
-// -----------------------------------------------------------------
-// main
-// -----------------------------------------------------------------
+// Round (sum_tenths / count) to nearest tenth, half-up.
+#[inline]
+fn mean_tenths(sum: i64, count: u64) -> i32 {
+    // Multiply numerator by 10 to get hundredths, then round to tenths.
+    // We want round(sum / count) where both are already in tenths.
+    // Equivalent to: round(sum_tenths / count).
+    let c = count as i64;
+    if sum >= 0 {
+        ((sum * 2 + c) / (2 * c)) as i32
+    } else {
+        -(((-sum) * 2 + c) / (2 * c)) as i32
+    }
+}
+
+// ── main ─────────────────────────────────────────────────────────
+
 fn main() -> io::Result<()> {
     let path = env::args().nth(1).unwrap_or_else(|| "measurements.txt".into());
-    let file = fs::File::open(&path)?;
+    let file = fs::File::open(&path)
+        .unwrap_or_else(|e| panic!("Cannot open '{}': {}", path, e));
 
-    // Safety: we treat the file as read-only bytes for the entire run.
-    let mmap = unsafe { Mmap::map(&file)? };
+    // SAFETY: we only read this mapping and never modify the backing file.
+    let mmap  = unsafe { Mmap::map(&file)? };
     let data: &[u8] = &mmap;
 
     let nthreads = rayon::current_num_threads().max(1);
-    let chunks   = split_chunks(data, nthreads);
+    let ranges   = split_at_newlines(data, nthreads);
 
-    // Process in parallel
-    let partial_maps: Vec<FxHashMap<&[u8], Stats>> = chunks
+    // Parallel processing — each thread owns its HashMap<String,Stats>
+    let partial: Vec<FxHashMap<String, Stats>> = ranges
         .into_par_iter()
-        .map(|chunk| process_chunk(chunk))
+        .map(|(start, end)| process_chunk(&data[start..end]))
         .collect();
 
-    // Merge all partial maps into one
-    let mut global: FxHashMap<&[u8], Stats> =
+    // Merge
+    let mut global: FxHashMap<String, Stats> =
         FxHashMap::with_capacity_and_hasher(1 << 14, Default::default());
 
-    for map in partial_maps {
+    for map in partial {
         for (k, v) in map {
             global
                 .entry(k)
@@ -197,34 +217,24 @@ fn main() -> io::Result<()> {
     }
 
     // Sort by station name
-    let mut entries: Vec<(&[u8], Stats)> = global.into_iter().collect();
-    entries.sort_unstable_by_key(|(k, _)| *k);
+    let mut entries: Vec<(String, Stats)> = global.into_iter().collect();
+    entries.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
 
-    // Output
+    // Print
     let stdout = io::stdout();
-    // Use a raw fd write for speed
     let mut out = io::BufWriter::with_capacity(1 << 20, stdout.lock());
 
-    out.write_all(b"{")?
-    ;
     let last = entries.len().saturating_sub(1);
+    out.write_all(b"{")? ;
     for (i, (name, s)) in entries.iter().enumerate() {
-        // mean rounded to one decimal place (round-half-up)
-        let mean_tenths = (s.sum * 10 + (s.count as i64 / 2) * (if s.sum >= 0 { 1 } else { -1 }))
-            / s.count as i64;
-        // Re-express as tenths (the *10 and /count give us the rounded 1-dp value in tenths)
-        // simpler: just round normally
-        let mean_tenths: i32 = {
-            let raw = s.sum as f64 / s.count as f64;
-            (raw * 10.0).round() as i32
-        };
-        let sep = if i < last { ", " } else { "" };
+        let mean = mean_tenths(s.sum, s.count);
+        let sep  = if i < last { ", " } else { "" };
         write!(
             out,
             "{}={}/{}/{}{}",
-            std::str::from_utf8(name).unwrap(),
+            name,
             fmt_temp(s.min),
-            fmt_temp(mean_tenths),
+            fmt_temp(mean),
             fmt_temp(s.max),
             sep
         )?;
