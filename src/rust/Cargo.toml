@@ -1,5 +1,5 @@
 [package]
-name = "onebrc"
+name = "calculate_average"
 version = "0.1.0"
 edition = "2021"
 
@@ -7,8 +7,13 @@ edition = "2021"
 name = "calculate_average"
 path = "src/main.rs"
 
+[dependencies]
+rayon     = "1"
+rustc-hash = "2"
+memmap2   = "0.9"
+
 [profile.release]
-opt-level = 3
-lto = true
+opt-level   = 3
+lto         = "fat"
 codegen-units = 1
-panic = "abort"
+panic       = "abort"
