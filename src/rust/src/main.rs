@@ -31,7 +31,7 @@
 //!  7. AVOID format!/write! IN HOT LOOP
 //!     Output is built with manual byte writes into a stack buffer.
 
-use memmap2::{Mmap, MmapOptions};
+use memmap2::MmapOptions;
 use rayon::prelude::*;
 use std::{
     env, fs,
@@ -63,7 +63,7 @@ struct Stats {
     // Station name stored inline — no heap pointer, cache-friendly
     name:  [u8; MAX_NAME],
     nlen:  u8,
-    // 0 means empty slot
+    // false means empty slot
     occupied: bool,
 }
 
@@ -191,13 +191,9 @@ fn fnv1a(data: &[u8]) -> usize {
 
 #[inline(always)]
 fn parse_temp(b: &[u8]) -> i32 {
-    // Read sign
     let neg = b[0] == b'-';
     let b   = if neg { &b[1..] } else { b };
 
-    // b is now one of: "d.d" (len 3) or "dd.d" (len 4)
-    // The decimal point is always at b[len-2].
-    // Units digit is always b[len-3] ... but simplest: branch on len.
     let v = if b.len() == 3 {
         // "X.Y"
         (b[0] - b'0') as i32 * 10 + (b[2] - b'0') as i32
@@ -215,8 +211,8 @@ fn parse_temp(b: &[u8]) -> i32 {
 //  Fast byte searcher                                                 //
 // ------------------------------------------------------------------ //
 //
-// Using a simple while loop; LLVM will auto-vectorise this to use
-// SSE2/AVX2 pcmpeqb instructions, scanning 16-32 bytes per iteration.
+// Simple while loop; LLVM auto-vectorises this to SSE2/AVX2 pcmpeqb,
+// scanning 16-32 bytes per clock cycle.
 
 #[inline(always)]
 fn find_byte(haystack: &[u8], needle: u8) -> usize {
@@ -262,20 +258,16 @@ fn process_chunk(chunk: &[u8]) -> Table {
     let len       = chunk.len();
 
     while pos < len {
-        // --- find ';' ---
-        // find_byte compiles to a tight SIMD loop
         let semi_off = find_byte(&chunk[pos..], b';');
         let semi     = pos + semi_off;
         if semi >= len { break; }
 
         let name = &chunk[pos..semi];
 
-        // --- find '\n' ---
-        let rest    = &chunk[semi + 1..];
-        let nl_off  = find_byte(rest, b'\n');
-        let eol     = semi + 1 + nl_off;
+        let rest   = &chunk[semi + 1..];
+        let nl_off = find_byte(rest, b'\n');
+        let eol    = semi + 1 + nl_off;
 
-        // Temp slice: between ';' and newline, strip optional '\r'
         let temp_end = if eol > semi + 1 && chunk[eol - 1] == b'\r' {
             eol - 1
         } else {
@@ -309,7 +301,7 @@ fn write_temp(buf: &mut [u8; 8], tenths: i32) -> usize {
         pos += 1;
         v    = -v;
     }
-    let abs = v as u32;
+    let abs       = v as u32;
     let int_part  = abs / 10;
     let frac_part = abs % 10;
     if int_part >= 10 {
@@ -328,7 +320,6 @@ fn write_temp(buf: &mut [u8; 8], tenths: i32) -> usize {
 #[inline]
 fn mean_tenths(sum: i64, count: u32) -> i32 {
     let c = count as i64;
-    // Round half-up: add c/2 before dividing
     if sum >= 0 {
         ((sum * 2 + c) / (c * 2)) as i32
     } else {
@@ -352,33 +343,25 @@ fn main() -> io::Result<()> {
         return Ok(());
     }
 
-    // --- Memory-map the file ---
-    // SAFETY: we treat this as read-only bytes for the entire run.
-    let mmap = unsafe {
-        MmapOptions::new()
-            .map(&file)?
-    };
+    // SAFETY: read-only mapping; file is not modified during the run.
+    let mmap = unsafe { MmapOptions::new().map(&file)? };
 
-    // Hint to the OS: we will read this sequentially.
-    // This triggers aggressive read-ahead, reducing page-fault stalls.
+    // Tell the OS to aggressively prefetch pages — reduces page-fault stalls.
     #[cfg(unix)]
     mmap.advise(memmap2::Advice::Sequential).ok();
 
-    let data: &[u8] = &mmap;
+    let data     = &mmap[..];
     let nthreads = rayon::current_num_threads().max(1);
     let ranges   = split_at_newlines(data, nthreads);
 
-    // --- Parallel processing ---
-    // Each thread gets its own Table (no locking, no sharing).
+    // Each thread builds its own Table — no locking, no sharing.
     let tables: Vec<Table> = ranges
         .into_par_iter()
         .map(|(start, end)| process_chunk(&data[start..end]))
         .collect();
 
-    // --- Merge all per-thread tables into one Vec<Stats> ---
-    // Build a single global hash table by merging thread-local ones.
+    // Merge per-thread tables into one global table.
     let mut global = Table::new();
-
     for table in &tables {
         for s in table.drain() {
             let name = &s.name[..s.nlen as usize];
@@ -390,7 +373,9 @@ fn main() -> io::Result<()> {
                     *slot = s;
                     break;
                 }
-                if slot.nlen == s.nlen && slot.name[..s.nlen as usize] == s.name[..s.nlen as usize] {
+                if slot.nlen == s.nlen
+                    && slot.name[..s.nlen as usize] == s.name[..s.nlen as usize]
+                {
                     slot.merge(&s);
                     break;
                 }
@@ -399,7 +384,7 @@ fn main() -> io::Result<()> {
         }
     }
 
-    // --- Collect, sort, print ---
+    // Collect, sort, print.
     let mut entries: Vec<Stats> = global.slots
         .iter()
         .filter(|s| s.occupied)
@@ -407,16 +392,14 @@ fn main() -> io::Result<()> {
         .collect();
 
     entries.sort_unstable_by(|a, b| {
-        let an = &a.name[..a.nlen as usize];
-        let bn = &b.name[..b.nlen as usize];
-        an.cmp(bn)
+        a.name[..a.nlen as usize].cmp(&b.name[..b.nlen as usize])
     });
 
     let stdout = io::stdout();
     let mut out = io::BufWriter::with_capacity(1 << 20, stdout.lock());
     let mut tmp = [0u8; 8];
+    let last    = entries.len().saturating_sub(1);
 
-    let last = entries.len().saturating_sub(1);
     out.write_all(b"{")?;
     for (i, s) in entries.iter().enumerate() {
         let name = &s.name[..s.nlen as usize];
@@ -424,13 +407,11 @@ fn main() -> io::Result<()> {
 
         out.write_all(name)?;
         out.write_all(b"=")?;
-
         let n = write_temp(&mut tmp, s.min);  out.write_all(&tmp[..n])?;
         out.write_all(b"/")?;
         let n = write_temp(&mut tmp, mean);   out.write_all(&tmp[..n])?;
         out.write_all(b"/")?;
         let n = write_temp(&mut tmp, s.max);  out.write_all(&tmp[..n])?;
-
         if i < last { out.write_all(b", ")?; }
     }
     out.write_all(b"}\n")?;
